@@ -14,7 +14,7 @@ Give it a URL and a prompt. It pulls the transcript (and optionally screenshots 
 ## Setup
 
 ```bash
-git clone <this-repo-url>
+git clone https://github.com/brolookslikeanfish67-hub/have-ai-agents-watch-videos
 cd <this-repo>
 pip install -r requirements.txt
 cp .env.example .env
