@@ -28,5 +28,4 @@ The agent acts as the "eyes and ears" for the AI by grabbing two main types of d
 
 ---
 
-## 🛠️ System Architecture
 
