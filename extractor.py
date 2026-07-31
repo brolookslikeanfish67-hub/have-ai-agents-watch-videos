@@ -12,6 +12,7 @@ import re
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional
 from urllib.parse import urlparse, parse_qs
 
@@ -23,14 +24,14 @@ from youtube_transcript_api._errors import (
 )
 
 
-@dataclass
+@dataclass(frozen=True)
 class TranscriptLine:
     text: str
     start: float
     duration: float
 
 
-@dataclass
+@dataclass(frozen=True)
 class Frame:
     timestamp: float
     path: str
@@ -48,26 +49,28 @@ def extract_video_id(url: str) -> str:
     """Pull the 11-character video ID out of any common YouTube URL shape."""
     url = url.strip()
 
-    # youtu.be/<id>
-    if "youtu.be" in url:
-        path = urlparse(url).path.lstrip("/")
-        if path:
-            return path.split("?")[0]
-
-    parsed = urlparse(url)
-
-    # youtube.com/watch?v=<id>
-    if "v" in parse_qs(parsed.query):
-        return parse_qs(parsed.query)["v"][0]
-
-    # youtube.com/embed/<id>, /shorts/<id>, /live/<id>
-    match = re.search(r"/(embed|shorts|live)/([A-Za-z0-9_-]{11})", parsed.path)
-    if match:
-        return match.group(2)
-
     # Bare 11-character ID passed directly
     if re.fullmatch(r"[A-Za-z0-9_-]{11}", url):
         return url
+
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+
+    # handle youtu.be/<id>
+    if "youtu.be" in hostname:
+        path = parsed.path.lstrip("/")
+        return path.split("?")[0] if path else url
+
+    # handle youtube.com/watch?v=<id> or /watch?vi=<id>
+    query_params = parse_qs(parsed.query)
+    for key in ("v", "vi"):
+        if key in query_params:
+            return query_params[key][0]
+
+    # handle youtube.com/embed/<id>, /shorts/<id>, /live/<id>, /v/<id>
+    match = re.search(r"/(embed|shorts|live|v)/([A-Za-z0-9_-]{11})", parsed.path)
+    if match:
+        return match.group(2)
 
     raise ValueError(f"Could not extract a video ID from: {url}")
 
@@ -80,12 +83,17 @@ def get_transcript(
     try:
         raw = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
     except NoTranscriptFound:
-        # Fall back to whatever language is available (e.g. auto-generated)
-        raw = YouTubeTranscriptApi.get_transcript(video_id)
+        try:
+            # Fall back to whatever language is available (e.g. auto-generated)
+            raw = YouTubeTranscriptApi.get_transcript(video_id)
+        except Exception as e:
+            raise RuntimeError(f"Failed to retrieve fallback transcript for video {video_id}") from e
     except TranscriptsDisabled as e:
         raise RuntimeError(f"Transcripts are disabled for video {video_id}") from e
     except VideoUnavailable as e:
         raise RuntimeError(f"Video {video_id} is unavailable") from e
+    except Exception as e:
+        raise RuntimeError(f"An unexpected error occurred while fetching transcript: {str(e)}") from e
 
     return [
         TranscriptLine(text=item["text"], start=item["start"], duration=item["duration"])
@@ -111,50 +119,65 @@ def extract_frames(
     output_dir: Optional[str] = None,
 ) -> List[Frame]:
     """
-    Download the video (lowest usable quality) with yt-dlp and pull one
-    screenshot every `interval_seconds`, up to `max_frames`, using ffmpeg.
+    Download the video (lowest quality) with yt-dlp and pull one
+    screenshot every `interval_seconds`, up to `max_frames`, using ffmpeg natively.
 
-    Requires yt-dlp and ffmpeg to be installed and on PATH.
+    Requires yt-dlp and ffmpeg to be installed on system PATH.
     """
-    import cv2  # imported here so transcript-only usage doesn't require opencv
+    output_path = Path(output_dir or tempfile.mkdtemp(prefix="yt_frames_"))
+    output_path.mkdir(parents=True, exist_ok=True)
 
-    output_dir = output_dir or tempfile.mkdtemp(prefix="yt_frames_")
-    os.makedirs(output_dir, exist_ok=True)
-
-    video_path = os.path.join(output_dir, f"{video_id}.mp4")
+    video_file = output_path / f"{video_id}.mp4"
     url = f"https://www.youtube.com/watch?v={video_id}"
 
+    # Step 1: Download low quality video using yt-dlp
     download_cmd = [
         "yt-dlp",
         "-f", "worst[ext=mp4][height>=240]/worst",
-        "-o", video_path,
+        "-o", str(video_file),
         url,
     ]
     result = subprocess.run(download_cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"yt-dlp failed to download video:\n{result.stderr}")
 
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-    duration = total_frames / fps if fps else 0
-
     frames: List[Frame] = []
-    timestamp = 0.0
-    while timestamp < duration and len(frames) < max_frames:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(timestamp * fps))
-        ok, image = cap.read()
-        if ok:
-            frame_path = os.path.join(output_dir, f"frame_{int(timestamp)}s.jpg")
-            cv2.imwrite(frame_path, image)
-            frames.append(Frame(timestamp=timestamp, path=frame_path))
-        timestamp += interval_seconds
+    
+    try:
+        # Step 2: Get absolute length duration using ffprobe
+        ffprobe_cmd = [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(video_file)
+        ]
+        duration_res = subprocess.run(ffprobe_cmd, capture_output=True, text=True)
+        duration = float(duration_res.stdout.strip()) if duration_res.returncode == 0 else 0.0
 
-    cap.release()
+        # Step 3: Fast and precise seeking frame extraction using native ffmpeg
+        timestamp = 0.0
+        while timestamp < duration and len(frames) < max_frames:
+            frame_file = output_path / f"frame_{int(timestamp)}s.jpg"
+            
+            ffmpeg_cmd = [
+                "ffmpeg", "-y", 
+                "-ss", str(timestamp),      # Seek before input is vastly faster
+                "-i", str(video_file), 
+                "-vframes", "1",            # Extract exactly 1 frame
+                "-q:v", "2",                # High quality JPEG output
+                str(frame_file)
+            ]
+            
+            # Run silently
+            subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            if frame_file.exists():
+                frames.append(Frame(timestamp=timestamp, path=str(frame_file)))
+                
+            timestamp += interval_seconds
 
-    # Clean up the downloaded video, we only needed the frames
-    if os.path.exists(video_path):
-        os.remove(video_path)
+    finally:
+        # Step 4: Clean up downloaded video file reliably even if extraction crashes
+        if video_file.exists():
+            video_file.unlink()
 
     return frames
 
